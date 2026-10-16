@@ -118,11 +118,25 @@ Status SoftmaxCrossEntropyLoss<T1, T2>::Compute(OpKernelContext* context) const 
   const TensorShape label_shape{label.Shape()};
   VerifyLogitWeightAndLabelShape(logit_shape, label_shape, p_weight ? &p_weight->Shape() : nullptr);
 
-  // Pre-empt the divide-by-zero in GetNDCFromLogitAndLabelShape (which does
-  // C = logit_shape.Size() / N_D). VerifyLogitWeightAndLabelShape only checks
-  // rank, not Size > 0 — e.g. label shape [3, 0, 5] is rank 2 but empty.
-  ORT_RETURN_IF_NOT(label_shape.Size() > 0,
-                    "SoftmaxCrossEntropyLoss: label tensor must not be empty.");
+  // Empty label (e.g. an empty batch: logit shape (0, C), label shape (0,)):
+  // there are no samples to score, so return the result the decomposed
+  // LogSoftmax + NegativeLogLikelihoodLoss graph produces instead of
+  // failing: an empty loss shaped like the label for reduction='none', and
+  // scalar 0 for 'sum'/'mean'. This must be handled before
+  // GetNDCFromLogitAndLabelShape, which divides by label_shape.Size().
+  // VerifyLogitWeightAndLabelShape only checks rank, not Size > 0 — e.g.
+  // label shape [3, 0, 5] is rank 2 but empty, and is handled here too.
+  if (label_shape.Size() == 0) {
+    Tensor* loss = context->Output(0, reduction_ == ReductionType::NONE ? TensorShape(label_shape) : TensorShape({}));
+    if (reduction_ != ReductionType::NONE) {
+      *loss->template MutableData<T1>() = static_cast<T1>(0);
+    }
+    if (context->OutputCount() > 1) {
+      // log_prob has the logit's shape, which is empty here as well.
+      context->Output(1, logit_shape);
+    }
+    return Status::OK();
+  }
 
   // N_D = N * D1 * D2...D*K
   int64_t N_D = 0;
@@ -309,9 +323,15 @@ Status SoftmaxCrossEntropyLossGrad<T1, T2>::Compute(OpKernelContext* context) co
   const TensorShape label_shape{label.Shape()};
   VerifyLogitWeightAndLabelShape(probability_shape, label_shape, p_weight ? &p_weight->Shape() : nullptr);
 
-  // Pre-empt the divide-by-zero in GetNDCFromLogitAndLabelShape (see forward Compute).
-  ORT_RETURN_IF_NOT(label_shape.Size() > 0,
-                    "SoftmaxCrossEntropyLossGrad: label tensor must not be empty.");
+  // Empty label (see forward Compute): the gradient w.r.t. the logits has
+  // the log-probability shape, which is empty here, and there is nothing to
+  // compute. Handle it before GetNDCFromLogitAndLabelShape divides by
+  // label_shape.Size(). A bias input, if present, is empty as well, so
+  // skipping the bias add below is a no-op.
+  if (label_shape.Size() == 0) {
+    context->Output(0, probability_shape);
+    return Status::OK();
+  }
 
   // N_D = N * D1 * D2...D*K
   int64_t N_D = 0;

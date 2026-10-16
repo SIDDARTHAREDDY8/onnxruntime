@@ -42,7 +42,14 @@ class ReshapeHelper {
         }
         size *= dim;
         if (dim == 0) {
-          has_zero_dim = allow_zero;
+          // A zero dimension is present whether it was given explicitly
+          // (allow_zero) or copied from a zero-sized input dimension.
+          // Recording it only for allow_zero made a valid reshape of an
+          // empty tensor with a -1 dimension (e.g. (0, 3) -> (0, 0, -1),
+          // the target built by SoftmaxCrossEntropyLoss's function body)
+          // fail below with a divide-by-zero size check, even though the
+          // -1 dimension is determined by the non-zero dimensions.
+          has_zero_dim = true;
         } else {
           if (size_for_inference > (std::numeric_limits<int64_t>::max() / dim)) {
             ORT_THROW("The requested shape has too many elements. Input shape:", input_shape,

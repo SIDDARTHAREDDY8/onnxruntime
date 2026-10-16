@@ -210,5 +210,63 @@ TEST(CrossEntropyTest, SoftmaxCrossEntropyLossInternalGrad_LabelTooLarge) {
   test.Run(OpTester::ExpectResult::kExpectFailure, "out of range");
 }
 
+// Empty batch (issue #33298): logit (0, C) and label (0,) have no samples to
+// score. The loss must match the decomposed LogSoftmax +
+// NegativeLogLikelihoodLoss graph instead of failing: an empty loss for
+// reduction='none' and scalar 0 for 'sum'/'mean'; log_prob is empty too.
+TEST(CrossEntropyTest, SoftmaxCrossEntropyLoss_EmptyBatchNoneReduction) {
+  OpTester test("SoftmaxCrossEntropyLoss", 13);
+  test.AddAttribute("reduction", std::string("none"));
+  test.AddAttribute("ignore_index", static_cast<int64_t>(-1));
+
+  test.AddInput<float>("X", {0, 3}, {});
+  test.AddInput<int64_t>("index", {0}, {});
+  test.AddOutput<float>("output", {0}, {});
+  test.AddOutput<float>("log_prob", {0, 3}, {});
+
+  test.Run();
+}
+
+TEST(CrossEntropyTest, SoftmaxCrossEntropyLoss_EmptyBatchSumReduction) {
+  OpTester test("SoftmaxCrossEntropyLoss", 13);
+  test.AddAttribute("reduction", std::string("sum"));
+  test.AddAttribute("ignore_index", static_cast<int64_t>(-1));
+
+  test.AddInput<float>("X", {0, 3}, {});
+  test.AddInput<int64_t>("index", {0}, {});
+  test.AddOutput<float>("output", {}, {0.0f});
+  test.AddOutput<float>("log_prob", {0, 3}, {});
+
+  test.Run();
+}
+
+TEST(CrossEntropyTest, SoftmaxCrossEntropyLoss_EmptyBatchMeanReduction) {
+  OpTester test("SoftmaxCrossEntropyLoss", 13);
+  test.AddAttribute("reduction", std::string("mean"));
+  test.AddAttribute("ignore_index", static_cast<int64_t>(-1));
+
+  test.AddInput<float>("X", {0, 3}, {});
+  test.AddInput<int64_t>("index", {0}, {});
+  test.AddOutput<float>("output", {}, {0.0f});
+  test.AddOutput<float>("log_prob", {0, 3}, {});
+
+  test.Run();
+}
+
+TEST(CrossEntropyTest, SoftmaxCrossEntropyLossGrad_EmptyBatch) {
+  OpTester test("SoftmaxCrossEntropyLossGrad", 1, onnxruntime::kMSDomain);
+  test.AddAttribute("reduction", std::string("sum"));
+  test.AddAttribute("ignore_index", static_cast<int64_t>(-1));
+
+  std::vector<float> dY_data = {1.0f};
+
+  test.AddInput<float>("dY", {}, dY_data);
+  test.AddInput<float>("log_prob", {0, 3}, {});
+  test.AddInput<int64_t>("index", {0}, {});
+  test.AddOutput<float>("dX", {0, 3}, {});
+
+  test.Run();
+}
+
 }  // namespace test
 }  // namespace onnxruntime

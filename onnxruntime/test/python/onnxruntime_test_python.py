@@ -3163,6 +3163,62 @@ class TestInferenceSession(unittest.TestCase):
         with self.subTest(case="Case 3: Same leaf-only tree but with a negative weight"):
             np.testing.assert_allclose(result_leaf_neg[1][0][1], expected_p1_leaf, atol=1e-5)
 
+    def test_softmax_cross_entropy_loss_empty_batch(self):
+        # Regression test for https://github.com/microsoft/onnxruntime/issues/33298:
+        # SoftmaxCrossEntropyLoss on an empty batch (scores (0, 3), labels (0,))
+        # must match the decomposed LogSoftmax + NegativeLogLikelihoodLoss graph:
+        # an empty (0,) loss for reduction="none" and scalar 0.0 for
+        # reduction="sum". Session creation used to fail with a Reshape
+        # ShapeInferenceError ("Product cannot be 0 in combination with -1").
+        try:
+            import onnx  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("onnx is not installed")
+
+        feeds = {
+            "scores": np.empty((0, 3), dtype=np.float32),
+            "labels": np.empty((0,), dtype=np.int64),
+        }
+
+        def make_model(reduction):
+            node = onnx.helper.make_node(
+                "SoftmaxCrossEntropyLoss", ["scores", "labels"], ["loss"], reduction=reduction
+            )
+            model = onnx.helper.make_model(
+                onnx.helper.make_graph(
+                    [node],
+                    "empty_batch_loss",
+                    [
+                        onnx.helper.make_tensor_value_info("scores", onnx.TensorProto.FLOAT, [0, 3]),
+                        onnx.helper.make_tensor_value_info("labels", onnx.TensorProto.INT64, [0]),
+                    ],
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "loss", onnx.TensorProto.FLOAT, [0] if reduction == "none" else []
+                        )
+                    ],
+                ),
+                opset_imports=[onnx.helper.make_opsetid("", 18)],
+                ir_version=10,
+            )
+            onnx.checker.check_model(model, full_check=True)
+            return model
+
+        for reduction in ("none", "sum"):
+            expected = (
+                np.empty((0,), dtype=np.float32) if reduction == "none" else np.array(0.0, dtype=np.float32)
+            )
+            for level in (onnxrt.GraphOptimizationLevel.ORT_DISABLE_ALL, onnxrt.GraphOptimizationLevel.ORT_ENABLE_ALL):
+                with self.subTest(reduction=reduction, graph_optimization_level=level):
+                    options = onnxrt.SessionOptions()
+                    options.graph_optimization_level = level
+                    session = onnxrt.InferenceSession(
+                        make_model(reduction).SerializeToString(), options, providers=["CPUExecutionProvider"]
+                    )
+                    output = session.run(None, feeds)[0]
+                    self.assertEqual(output.shape, expected.shape)
+                    np.testing.assert_array_equal(output, expected)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
