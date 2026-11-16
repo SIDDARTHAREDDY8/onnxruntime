@@ -472,6 +472,38 @@ static bool IsQuantizeLinearOutputType(api::DataType dtype) {
 }
 
 /// <summary>
+/// Resolve the dtype of a value, falling back to the producing node when the value info
+/// has no type. Value infos can read as UNDEFINED during optimization even when the type is
+/// fixed: a Cast-produced value's type is determined by the Cast's `to` attribute, and an
+/// initializer's type is the tensor's dtype. Without this fallback the INT32 check below
+/// misses Cast-produced INT32 inputs and inserts an invalid QuantizeLinear (#33443).
+/// </summary>
+static api::DataType ResolveDType(api::GraphRef& graph, std::string_view value_name) {
+  auto value_info = graph.GetValueInfo(value_name);
+  if (value_info != nullptr) {
+    api::DataType dtype = value_info->DType();
+    if (dtype != api::DataType::UNDEFINED) {
+      return dtype;
+    }
+  }
+
+  auto constant = graph.GetConstant(value_name);
+  if (constant != nullptr) {
+    return constant->DType();
+  }
+
+  auto producer = graph.GetNodeProducingOutput(value_name);
+  if (producer != nullptr && producer->OpType() == "Cast") {
+    std::optional<int64_t> to = producer->GetAttributeInt("to");
+    if (to.has_value()) {
+      return static_cast<api::DataType>(*to);
+    }
+  }
+
+  return api::DataType::UNDEFINED;
+}
+
+/// <summary>
 /// Insert a Q -> DQ pair after the node following the DQ by using scale and zp info from the preceding DQ node.
 /// DQ -> next node => DQ -> next node -> Q -> DQ.
 /// This is only called for Transpose and Unsqueeze nodes.
@@ -563,15 +595,19 @@ static bool MakeQDQNodeUnit(api::GraphRef& graph, const api::NodeRef& dq_node) {
   } else if (!zp_input.value().empty()) {
     // With an explicit zero point, the new Q reuses that zero point verbatim, so the zero
     // point's type becomes the Q output type (the Q output's value info is copied from the
-    // DQ input below). INT32 dequantized data with an INT32 zero point is valid for
-    // DequantizeLinear, but QuantizeLinear has no INT32 output, so the inserted Q made the
-    // graph invalid (#33443). Skip the push-through for that case, leaving the dequantized
-    // path unquantized. Only reject INT32: QuantizeLinear also supports types that
-    // api::DataType does not model (e.g. INT4 and UINT4 at opset 21), so an allowlist check
-    // here would wrongly disable this repair for supported quantized graphs.
-    const api::DataType dq_input_dtype = graph.GetValueInfo(dq_inputs[0])->DType();
-    const api::DataType zp_dtype = graph.GetValueInfo(zp_input.value())->DType();
-    if (dq_input_dtype == api::DataType::INT32 || zp_dtype == api::DataType::INT32) {
+    // DQ input below). QuantizeLinear cannot produce every type: INT32 dequantized data
+    // with an INT32 zero point is valid for DequantizeLinear, but QuantizeLinear has no
+    // INT32 output, so the inserted Q made the graph invalid (#33443). Skip the
+    // push-through when either type is a known type that QuantizeLinear cannot output,
+    // leaving the dequantized path unquantized. Types api::DataType does not model (e.g.
+    // INT4 and UINT4 at opset 21) read as UNDEFINED and are left alone, so this repair
+    // still runs for supported quantized graphs. ResolveDType falls back to a producing
+    // Cast's `to` attribute, as value infos can read as UNDEFINED during optimization
+    // even when the type is fixed.
+    const api::DataType dq_input_dtype = ResolveDType(graph, dq_inputs[0]);
+    const api::DataType zp_dtype = ResolveDType(graph, zp_input.value());
+    if ((dq_input_dtype != api::DataType::UNDEFINED && !IsQuantizeLinearOutputType(dq_input_dtype)) ||
+        (zp_dtype != api::DataType::UNDEFINED && !IsQuantizeLinearOutputType(zp_dtype))) {
       return false;
     }
   }
@@ -3253,6 +3289,18 @@ static bool TryFixTransposeMissingDQ(OptimizerCtx& ctx, api::NodeRef& transpose_
   std::vector<std::string_view> inputs = {"", scale_input};
   if (zp_input) {
     inputs.push_back(zp_input.value());
+  }
+
+  // The new Q reuses the existing Q's scale and zero point verbatim, so the zero point's
+  // type becomes the new Q's output type. QuantizeLinear cannot produce every type (e.g.
+  // INT32, #33443), so skip the repair when the zero point's type is a known type that
+  // QuantizeLinear cannot output. Types api::DataType does not model (e.g. INT4 and UINT4
+  // at opset 21) read as UNDEFINED and are left alone.
+  if (zp_input && !zp_input.value().empty()) {
+    const api::DataType zp_dtype = ResolveDType(ctx.graph, zp_input.value());
+    if (zp_dtype != api::DataType::UNDEFINED && !IsQuantizeLinearOutputType(zp_dtype)) {
+      return false;
+    }
   }
 
   // Add Q
